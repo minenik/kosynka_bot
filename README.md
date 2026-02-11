@@ -71,7 +71,7 @@ python learning_kosynka.py --play --dqn --model dqn_model.pt --device auto
 
 ---
 
-## Ubuntu / мощная машина
+## Ubuntu
 
 Для переноса обучения на Ubuntu используйте:
 
