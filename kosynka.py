@@ -10,8 +10,16 @@ from threading import Thread
 import statistics
 
 TEMPLATE_FOLDER = "templates/templates"
-THRESHOLD = 0.88
+THRESHOLD = 0.86
 TOP_CARD_OFFSET = 50
+TOP_ZONE_RATIO = 0.43
+TABLEAU_LEFT_RATIO = 0.28
+TABLEAU_RIGHT_RATIO = 0.72
+TOP_ROW_MIN_RATIO = 0.10
+TOP_ROW_MAX_RATIO = 0.34
+WASTE_LEFT_RATIO = 0.34
+WASTE_RIGHT_RATIO = 0.45
+FOUNDATION_LEFT_RATIO = 0.50
 
 class KosynkaBot:
     def __init__(self):
@@ -34,6 +42,29 @@ class KosynkaBot:
         self.column_x = {}
         self.column_memory = {i: [] for i in range(1, 8)}
         self.img_width = 800
+        self.img_height = 400
+        self.tableau_base_y = 260
+        self.stuck_ticks = 0
+        self.max_stuck_ticks = 25
+        self.undo_attempts = 0
+        self.max_undo_attempts = 3
+        self.restart_count = 0
+        self.last_foundation_total = 0
+        self.stock_click_pos = None
+        self.last_king_move = None
+        self.last_draw_deck_name = None
+        self.last_action_was_draw = False
+        self.failed_draws = 0
+        self.stock_probe_idx = 0
+        self.stock_probe_offsets = [
+            (0, 0),
+            (-12, 0),
+            (12, 0),
+            (0, -10),
+            (0, 10),
+            (-18, -8),
+            (18, -8),
+        ]
 
         self.root.bind('<Escape>', lambda e: self.stop_loop())
         self.root.bind('<space>', lambda e: self.toggle_loop())
@@ -67,25 +98,33 @@ class KosynkaBot:
             field_img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
             gray_field = cv2.cvtColor(field_img, cv2.COLOR_BGR2GRAY)
             self.img_width = field_img.shape[1]
+            self.img_height = field_img.shape[0]
 
             matches = self.match_all_cards(gray_field)
             matches = self.filter_duplicates(matches)
             field = self.build_field_structure_dynamic(matches, field_img.shape[1])
-            deck_card = self.detect_deck_card(matches)
-            homes = self.detect_home_cards(matches)
+            deck_card = self.detect_deck_card(matches, self.img_width, self.img_height)
+            homes = self.detect_home_cards(matches, self.img_width, self.img_height)
+            self.update_stock_click(deck_card)
+            self.observe_draw_result(deck_card)
 
             self.update_home_state_from_homes(homes)
             self.print_field_state(deck_card, homes, field)
 
             if self.try_home_drop_deck(deck_card, x, y):
+                self.last_action_was_draw = False
+                self.register_progress()
                 time.sleep(1.0)
                 continue
 
             if self.try_home_drop(field, x, y):
+                self.last_action_was_draw = False
+                self.register_progress()
                 time.sleep(1.0)
                 continue
 
             if self.try_king_to_empty(field, x, y):
+                self.last_action_was_draw = False
                 time.sleep(1.0)
                 continue
 
@@ -93,8 +132,9 @@ class KosynkaBot:
             if move and move != self.last_move:
                 if self.is_repeating_move(move):
                     print("\U0001f501 Обнаружен зацикливающийся ход, остановка")
-                    self.running = False
-                    break
+                    self.handle_stuck(x, y, hard=True)
+                    time.sleep(1.0)
+                    continue
                 source_card, src_pos, dst_pos = move
                 print(f"\n\U0001f449 Делаем ход: {source_card} с {src_pos} на {dst_pos}")
                 pyautogui.moveTo(int(x + src_pos[0]), int(y + src_pos[1]))
@@ -128,13 +168,99 @@ class KosynkaBot:
                 self.move_history.append(move)
                 if len(self.move_history) > 4:
                     self.move_history.pop(0)
+                self.last_action_was_draw = False
+                self.last_king_move = None
+                self.stuck_ticks = max(0, self.stuck_ticks - 1)
                 time.sleep(2.0)
             else:
                 print("\U0001f504 Листаем колоду")
-                pyautogui.click(x + 60, y + 60)
+                self.last_action_was_draw = True
+                self.click_stock(x, y)
+                self.stuck_ticks += 1
+                if self.stuck_ticks >= self.max_stuck_ticks:
+                    self.handle_stuck(x, y)
                 time.sleep(1.0)
 
         self.root.deiconify()
+
+    def get_ui_point(self, name):
+        presets = {
+            'new_game': (0.05, 0.045),
+            'restart': (0.16, 0.045),
+            'undo': (0.28, 0.045),
+            'stock': (0.305, 0.185),
+        }
+        px, py = presets[name]
+        return int(px * self.img_width), int(py * self.img_height)
+
+    def click_stock(self, ox, oy):
+        sx, sy = self.get_ui_point('stock')
+        dx, dy = self.stock_probe_offsets[self.stock_probe_idx]
+        pyautogui.moveTo(int(ox + sx + dx), int(oy + sy + dy))
+        pyautogui.click()
+
+    def observe_draw_result(self, deck_card):
+        current_name = deck_card[0] if deck_card else ''
+        if self.last_action_was_draw:
+            if current_name == self.last_draw_deck_name:
+                self.failed_draws += 1
+                if self.failed_draws >= 2:
+                    self.stock_probe_idx = (self.stock_probe_idx + 1) % len(self.stock_probe_offsets)
+                    self.failed_draws = 0
+                    print(f"🎯 Сдвиг точки клика по колоде: probe #{self.stock_probe_idx + 1}")
+            else:
+                self.failed_draws = 0
+        self.last_draw_deck_name = current_name
+
+    def click_control(self, ox, oy, control):
+        cx, cy = self.get_ui_point(control)
+        pyautogui.click(int(ox + cx), int(oy + cy))
+
+    def update_stock_click(self, deck_card):
+        # Keep stock click fixed for this layout; dynamic offset caused misses.
+        return
+
+    def register_progress(self):
+        foundation_total = sum(self.home_state.values())
+        if foundation_total > self.last_foundation_total:
+            self.last_foundation_total = foundation_total
+            self.stuck_ticks = 0
+            self.undo_attempts = 0
+            self.restart_count = 0
+
+    def reset_round_state(self):
+        self.last_move = None
+        self.last_king_move = None
+        self.move_history.clear()
+        self.column_memory = {i: [] for i in range(1, 8)}
+        self.home_state = {'h': 0, 'b': 0, 'k': 0, 'p': 0}
+        self.stuck_ticks = 0
+        self.last_foundation_total = 0
+        self.last_draw_deck_name = None
+        self.last_action_was_draw = False
+        self.failed_draws = 0
+        self.stock_probe_idx = 0
+
+    def handle_stuck(self, ox, oy, hard=False):
+        self.stuck_ticks = 0
+        if self.undo_attempts < self.max_undo_attempts and not hard:
+            self.undo_attempts += 1
+            print(f"↩ Undo ход ({self.undo_attempts}/{self.max_undo_attempts})")
+            self.click_control(ox, oy, 'undo')
+            time.sleep(0.8)
+            return
+
+        self.undo_attempts = 0
+        self.restart_count += 1
+        if self.restart_count <= 3:
+            print("♻ Restart текущей партии")
+            self.click_control(ox, oy, 'restart')
+        else:
+            print("🎲 Новая игра")
+            self.restart_count = 0
+            self.click_control(ox, oy, 'new_game')
+        time.sleep(1.0)
+        self.reset_round_state()
 
     def update_home_state_from_homes(self, homes):
         for card in homes:
@@ -182,20 +308,24 @@ class KosynkaBot:
 
         for col, cards in field.items():
             if cards and cards[-1][0].startswith("k"):
+                target_col = empty_cols[0]
+                if self.last_king_move == (target_col, col):
+                    continue
+
                 src_pos = self.estimate_card_position(col, cards)
-                dst_x = self.column_x.get(empty_cols[0], self.margin + (empty_cols[0] - 1) * self.spacing)
-                dst_y = 250 + 10
+                dst_x = self.column_x.get(target_col, self.margin + (target_col - 1) * self.spacing)
+                dst_y = self.tableau_base_y + 10
                 if src_pos[1] < 200:
                     continue
-                print(f"\U0001f451 Перемещаем короля из колонки {col} в {empty_cols[0]}")
+                print(f"King move: column {col} -> {target_col}")
                 pyautogui.moveTo(ox + src_pos[0], oy + src_pos[1])
                 pyautogui.dragTo(ox + dst_x, oy + dst_y, duration=0.4)
                 if self.column_memory.get(col):
                     card = self.column_memory[col].pop()
-                    self.column_memory[empty_cols[0]].append(card)
+                    self.column_memory[target_col].append(card)
+                self.last_king_move = (col, target_col)
                 return True
         return False
-
     def match_all_cards(self, gray_img):
         matches = []
         for filename in os.listdir(TEMPLATE_FOLDER):
@@ -227,18 +357,14 @@ class KosynkaBot:
 
     def build_field_structure_dynamic(self, matches, img_width):
         columns = defaultdict(list)
-        self.margin = 30
-        self.spacing = (img_width - 2 * self.margin) // 6
-        column_ranges = [
-            (
-                self.margin + i * self.spacing - self.spacing // 2,
-                self.margin + i * self.spacing + self.spacing // 2,
-            )
-            for i in range(7)
-        ]
+        self.margin = int(img_width * TABLEAU_LEFT_RATIO)
+        right_bound = int(img_width * TABLEAU_RIGHT_RATIO)
+        self.spacing = max(40, (right_bound - self.margin) // 6)
+        tableau_top = max(180, int(self.img_height * 0.28))
+        self.tableau_base_y = max(int(self.img_height * 0.50), tableau_top + 120)
 
         for x, y, w, h, name in matches:
-            if y < 200:
+            if y < tableau_top:
                 continue
             cx = x + w // 2
             cy = y + h // 2
@@ -271,29 +397,51 @@ class KosynkaBot:
                 if self.column_memory[i]:
                     x = self.column_x.get(i, self.margin + (i - 1) * self.spacing)
                     field[i] = [
-                        (name, x, 260 + idx * 35)
+                        (name, x, self.tableau_base_y + idx * 35)
                         for idx, name in enumerate(self.column_memory[i])
                     ]
                 else:
                     field[i] = []
         return field
 
-    def detect_deck_card(self, matches):
+    def detect_deck_card(self, matches, img_width=None, img_height=None):
+        img_width = img_width or self.img_width
+        img_height = img_height or self.img_height
+        top_min = int(img_height * TOP_ROW_MIN_RATIO)
+        top_max = int(img_height * TOP_ROW_MAX_RATIO)
+        waste_left = int(img_width * WASTE_LEFT_RATIO)
+        waste_right = int(img_width * WASTE_RIGHT_RATIO)
+        waste_center = int((waste_left + waste_right) / 2)
+
+        candidates = []
         for x, y, w, h, name in matches:
-            if y > 200:
+            cy = y + h // 2
+            if cy < top_min or cy > top_max:
                 continue
             cx = x + w // 2
-            if 160 < cx < 280:
-                return (name, (cx, y + h // 2))
+            if waste_left <= cx <= waste_right:
+                candidates.append((abs(cx - waste_center), name, (cx, cy)))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1], candidates[0][2]
         return None
 
-    def detect_home_cards(self, matches):
+    def detect_home_cards(self, matches, img_width=None, img_height=None):
+        img_width = img_width or self.img_width
+        img_height = img_height or self.img_height
+        top_min = int(img_height * TOP_ROW_MIN_RATIO)
+        top_max = int(img_height * TOP_ROW_MAX_RATIO)
         homes = [''] * 4
-        top = [(x, y, w, h, name) for x, y, w, h, name in matches if y < 200]
+        top = []
+        for x, y, w, h, name in matches:
+            cy = y + h // 2
+            if top_min <= cy <= top_max:
+                top.append((x, y, w, h, name))
         if not top:
             return homes
 
-        right_zone = [m for m in top if m[0] > 300]
+        right_zone = [m for m in top if m[0] > int(img_width * FOUNDATION_LEFT_RATIO)]
         right_zone.sort(key=lambda m: m[0])
 
         for i, card in enumerate(right_zone[:4]):
@@ -408,13 +556,13 @@ class KosynkaBot:
             if index is None:
                 index = len(self.column_memory[col]) - 1
             x = self.column_x.get(col, self.margin + (col - 1) * self.spacing)
-            y = 260 + index * 35
+            y = self.tableau_base_y + index * 35
             if is_source and top_only and index == len(self.column_memory[col]) - 1:
                 y -= TOP_CARD_OFFSET
             return (x, y)
 
         x = self.column_x.get(col, self.margin + (col - 1) * self.spacing)
-        return (x, 260)
+        return (x, self.tableau_base_y)
 
     def print_field_state(self, deck_card, homes, field):
         print("\n====== Состояние поля ======")
@@ -441,3 +589,5 @@ class KosynkaBot:
 
 if __name__ == "__main__":
     KosynkaBot()
+
+

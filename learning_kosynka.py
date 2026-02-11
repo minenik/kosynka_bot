@@ -20,6 +20,14 @@ RANKS = ['t', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'v', 'd', 'k']
 VALUE_MAP = {r: i + 1 for i, r in enumerate(RANKS)}
 
 
+def resolve_torch_device(requested: str = "auto") -> torch.device:
+    if requested == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def card_value(card: str) -> int:
     for r in RANKS:
         if card.startswith(r):
@@ -34,6 +42,8 @@ def card_color(card: str) -> str:
 class SolitaireEnv:
     def __init__(self, seed: int | None = None):
         self.rng = random.Random(seed)
+        self.max_steps = 700
+        self.max_stagnation = 180
         self.reset()
 
     def reset(self) -> Tuple[Any, ...]:
@@ -49,6 +59,8 @@ class SolitaireEnv:
         self.stock = deck
         self.waste: List[str] = []
         self.foundation: Dict[str, List[str]] = {s: [] for s in SUITS}
+        self.steps = 0
+        self.stagnation = 0
         return self.get_state()
 
     def get_state(self) -> Tuple[Any, ...]:
@@ -94,7 +106,7 @@ class SolitaireEnv:
     def legal_actions(self) -> List[Tuple[Any, ...]]:
         actions: List[Tuple[Any, ...]] = []
         
-        if self.stock:
+        if self.stock or self.waste:
             actions.append(('draw',))
         
         deck_card = self.waste[-1] if self.waste else None
@@ -108,6 +120,13 @@ class SolitaireEnv:
                     actions.append(('waste_to_tableau', j))
 
         for i in range(7):
+            top_card = self._top_face_up(i)
+            if top_card:
+                val = card_value(top_card)
+                suit = top_card[-1]
+                if val == len(self.foundation[suit]) + 1:
+                    actions.append(('tableau_to_foundation', i))
+
             col = self.tableau[i]
             for start in range(len(col)):
                 card, face = col[start]
@@ -142,41 +161,58 @@ class SolitaireEnv:
                 return False
         return True
 
-    def step(self, action: Tuple[Any, ...]) -> Tuple[Tuple[Any, ...], int, bool]:
-        reward = 0
+    def foundation_count(self) -> int:
+        return sum(len(p) for p in self.foundation.values())
+
+    def hidden_count(self) -> int:
+        hidden = 0
+        for col in self.tableau:
+            hidden += sum(1 for _, face in col if not face)
+        return hidden
+
+    def step(self, action: Tuple[Any, ...]) -> Tuple[Tuple[Any, ...], float, bool]:
+        prev_foundation = self.foundation_count()
+        prev_hidden = self.hidden_count()
+        reward = -0.01
+        recycled = False
+
         match action[0]:
             case 'draw':
                 if self.stock:
                     self.waste.append(self.stock.pop(0))
+                    reward -= 0.02
                 else:
                     self.stock = list(reversed(self.waste))
                     self.waste = []
                     if self.stock:
                         self.waste.append(self.stock.pop(0))
+                        recycled = True
+                    reward -= 0.2
 
             case 'waste_to_tableau':
                 _, j = action
                 card = self.waste.pop()
                 self.tableau[j].append((card, True))
+                reward += 0.1
 
             case 'waste_to_foundation':
                 card = self.waste.pop()
                 self.foundation[card[-1]].append(card)
-                reward = 1
+                reward += 8.0
 
             case 'tableau_to_foundation':
                 _, i = action
                 card = self._remove_top_face_up(i)
                 if card:
                     self.foundation[card[-1]].append(card)
-                    reward = 1
+                    reward += 8.0
 
             case 'tableau_to_tableau':
                 _, i, j = action
                 card = self._remove_top_face_up(i)
                 if card:
                     self.tableau[j].append((card, True))
-                    reward = -0.1 if i != j else -0.5
+                    reward += 0.15 if i != j else -0.5
 
             case 'move_stack':
                 _, from_col, start_idx, to_col = action
@@ -185,15 +221,40 @@ class SolitaireEnv:
                 del self.tableau[from_col][start_idx:]
                 if start_idx > 0 and not self.tableau[from_col][start_idx - 1][1]:
                     self.tableau[from_col][start_idx - 1] = (self.tableau[from_col][start_idx - 1][0], True)
+                reward += 0.1
 
             case 'foundation_to_tableau':
                 _, suit, j = action
                 if self.foundation[suit]:
                     card = self.foundation[suit].pop()
                     self.tableau[j].append((card, True))
-                    reward = -0.5 
+                    reward -= 2.0
 
-        done = sum(len(p) for p in self.foundation.values()) == 52
+        self.steps += 1
+        foundation_gain = self.foundation_count() - prev_foundation
+        hidden_gain = prev_hidden - self.hidden_count()
+
+        if foundation_gain > 0:
+            reward += 5.0 * foundation_gain
+        if hidden_gain > 0:
+            reward += 3.0 * hidden_gain
+
+        if foundation_gain == 0 and hidden_gain == 0 and action[0] != 'draw':
+            reward -= 0.05
+        if recycled:
+            reward -= 0.15
+
+        if foundation_gain == 0 and hidden_gain == 0:
+            self.stagnation += 1
+        else:
+            self.stagnation = 0
+
+        done = self.foundation_count() == 52
+        if done:
+            reward += 120.0
+        elif self.steps >= self.max_steps or self.stagnation >= self.max_stagnation:
+            done = True
+
         return self.get_state(), reward, done
     
     def completion_percent(self) -> float:
@@ -202,11 +263,20 @@ class SolitaireEnv:
 
 
 class QLearningAgent:
-    def __init__(self, alpha: float = 0.1, gamma: float = 0.9, epsilon: float = 0.1):
+    def __init__(
+        self,
+        alpha: float = 0.12,
+        gamma: float = 0.995,
+        epsilon: float = 1.0,
+        epsilon_min: float = 0.05,
+        epsilon_decay: float = 0.9995,
+    ):
         self.q: Dict[Tuple[str, str], float] = defaultdict(float)
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
 
     def _key(self, state: Tuple[Any, ...], action: Tuple[Any, ...]) -> Tuple[str, str]:
         return str(state), str(action)
@@ -225,71 +295,80 @@ class QLearningAgent:
                 best = a
         return best
 
-    def update(self, state: Tuple[Any, ...], action: Tuple[Any, ...], reward: float, next_state: Tuple[Any, ...], next_actions: List[Tuple[Any, ...]]):
+    def update(
+        self,
+        state: Tuple[Any, ...],
+        action: Tuple[Any, ...],
+        reward: float,
+        next_state: Tuple[Any, ...],
+        next_actions: List[Tuple[Any, ...]],
+        done: bool,
+    ):
         key = self._key(state, action)
-        best_next = max((self.q[self._key(next_state, a)] for a in next_actions), default=0.0)
+        best_next = 0.0 if done else max((self.q[self._key(next_state, a)] for a in next_actions), default=0.0)
         self.q[key] += self.alpha * (reward + self.gamma * best_next - self.q[key])
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
 
 
 def train_q_learning(episodes: int = 1000, verbose: bool = False) -> Dict[Tuple[str, str], float]:
     env = SolitaireEnv()
     agent = QLearningAgent()
-    completion_scores = [] 
+    completion_scores = []
+    wins = 0
 
     for ep in range(episodes):
-        state_counter = defaultdict(int)
         state = env.reset()
         done = False
-        progress = 100.0 * (ep + 1) / episodes
 
         if verbose:
             print_tableau(env.tableau, env.stock, env.waste, env.foundation)
-            print("Reward: —") 
-
-
+            print("Reward: -")
 
         while not done:
             actions = env.legal_actions()
             action = agent.choose(state, actions)
             if action is None:
                 if verbose:
-                    print("No legal actions!")
+                    print("No legal actions.")
                 break
 
             next_state, reward, done = env.step(action)
             next_actions = env.legal_actions()
-            agent.update(state, action, reward, next_state, next_actions)
+            agent.update(state, action, reward, next_state, next_actions, done)
             state = next_state
-
-            state_counter[state] += 1
-            if state_counter[state] > 3:
-                if verbose:
-                    print("🔁 Зацикливание. Завершаем эпизод.")
-                break
 
             if verbose:
                 print_tableau(env.tableau, env.stock, env.waste, env.foundation)
                 print(f"Reward: {reward}")
                 bar_width = 20
                 filled = int((ep + 1) / episodes * bar_width)
-                bar = '█' * filled + '▒' * (bar_width - filled)
-                print(f"Эпизод {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Прогресс: {env.completion_percent():.1f}%\n")
-
+                bar = "#" * filled + "-" * (bar_width - filled)
+                print(f"Episode {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Completion: {env.completion_percent():.1f}%")
 
         percent = env.completion_percent()
         completion_scores.append(percent)
+        if percent >= 100.0:
+            wins += 1
+        agent.decay_epsilon()
         bar_width = 20
         filled = int((ep + 1) / episodes * bar_width)
-        bar = '█' * filled + '▒' * (bar_width - filled)
-        print(f"\rЭпизод {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Прогресс: {percent:.1f}%", end='', flush=True)
-
+        bar = "#" * filled + "-" * (bar_width - filled)
+        print(
+            f"\rEpisode {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% "
+            f"| Completion: {percent:.1f}% | eps: {agent.epsilon:.3f}",
+            end='',
+            flush=True,
+        )
 
     avg_completion = sum(completion_scores) / len(completion_scores)
-    print(f"\nСредний прогресс за {episodes} эпизодов: {avg_completion:.1f}% карт.")
+    win_rate = 100.0 * wins / max(1, episodes)
+    print(f"\nAverage completion over {episodes} episodes: {avg_completion:.1f}% of cards.")
+    print(f"Wins: {wins}/{episodes} ({win_rate:.2f}%)")
     print()
     return agent.q
-
 def print_tableau(tableau, stock, waste, foundation):
     print("====== Состояние поля ======")
     print("Домики (foundation): ", end="")
@@ -424,11 +503,13 @@ class RLKosynkaBot(KosynkaBot):
             field_img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
             gray_field = cv2.cvtColor(field_img, cv2.COLOR_BGR2GRAY)
             self.img_width = field_img.shape[1]
+            self.img_height = field_img.shape[0]
             matches = self.match_all_cards(gray_field)
             matches = self.filter_duplicates(matches)
             field = self.build_field_structure_dynamic(matches, field_img.shape[1])
-            deck_card = self.detect_deck_card(matches)
-            homes = self.detect_home_cards(matches)
+            deck_card = self.detect_deck_card(matches, self.img_width, self.img_height)
+            homes = self.detect_home_cards(matches, self.img_width, self.img_height)
+            self.update_stock_click(deck_card)
             self.update_home_state_from_homes(homes)
             state = self.state_from_board(deck_card, field)
             actions = self.board_actions(deck_card, field, x, y)
@@ -442,69 +523,118 @@ class RLKosynkaBot(KosynkaBot):
                     pyautogui.moveTo(x + src[0], y + src[1])
                     pyautogui.dragTo(x + dst[0], y + dst[1], duration=0.4)
                 case 'click_deck':
-                    pyautogui.click(x + 60, y + 60)
+                    self.click_stock(x, y)
             time.sleep(1.0)
         self.root.deiconify()
 
 class DQNAgent:
-    def __init__(self, state_size, action_size, lr=1e-3, gamma=0.99, epsilon=1.0):
+    def __init__(
+        self,
+        state_size,
+        action_size,
+        device: torch.device,
+        lr=3e-4,
+        gamma=0.995,
+        epsilon=1.0,
+        epsilon_min=0.05,
+        epsilon_decay=0.9999,
+    ):
         self.state_size = state_size
         self.action_size = action_size
+        self.device = device
         self.gamma = gamma
         self.epsilon = epsilon
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
-        self.model = self._build_model()
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.model = self._build_model().to(self.device)
+        self.target_model = self._build_model().to(self.device)
+        self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.memory = deque(maxlen=10000)
+        self.memory = deque(maxlen=50000)
         self.loss_fn = nn.MSELoss()
+        self.use_amp = self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        self.batch_size = 256 if self.device.type == "cuda" else 64
+        self.learn_steps = 0
+        self.target_sync_every = 500
+        self.replay_start_size = 2000 if self.device.type == "cuda" else 500
 
     def _build_model(self):
         return nn.Sequential(
-            nn.Linear(self.state_size, 128),
+            nn.Linear(self.state_size, 256),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(128, self.action_size)
+            nn.Linear(256, self.action_size)
         )
 
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+    def remember(self, state, action, reward, next_state, next_legal_actions, done):
+        self.memory.append((state, action, reward, next_state, tuple(next_legal_actions), done))
 
     def act(self, state, legal_actions):
         if random.random() < self.epsilon:
             return random.choice(legal_actions)
-        state_t = torch.FloatTensor(state).unsqueeze(0)
-        q_values = self.model(state_t).detach().numpy()[0]
-        best = max(legal_actions, key=lambda a: q_values[a])
-        return best
+        state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.model(state_t)[0]
+        return max(legal_actions, key=lambda a: float(q_values[a]))
 
-    def replay(self, batch_size=64):
-        if len(self.memory) < batch_size:
+    def replay(self):
+        if len(self.memory) < self.replay_start_size:
             return
-        batch = random.sample(self.memory, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        states = torch.FloatTensor(states)
-        next_states = torch.FloatTensor(next_states)
-        targets = self.model(states).detach().clone()
-        next_q = self.model(next_states).detach().max(1)[0]
-        for i in range(batch_size):
-            targets[i][actions[i]] = rewards[i] + (0 if dones[i] else self.gamma * next_q[i])
-        self.model.train()
-        predictions = self.model(states)
-        loss = self.loss_fn(predictions, targets)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        batch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states, next_legals, dones = zip(*batch)
+
+        states = torch.tensor(states, dtype=torch.float32, device=self.device)
+        next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
+        action_tensor = torch.tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
+
+        with torch.no_grad():
+            next_q_all = self.target_model(next_states)
+            targets = []
+            for i in range(self.batch_size):
+                if dones[i]:
+                    targets.append(float(rewards[i]))
+                    continue
+                legal = next_legals[i]
+                if not legal:
+                    targets.append(float(rewards[i]))
+                    continue
+                best_next = torch.max(next_q_all[i, list(legal)]).item()
+                targets.append(float(rewards[i]) + self.gamma * best_next)
+            target_tensor = torch.tensor(targets, dtype=torch.float32, device=self.device)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_amp):
+            q_values = self.model(states)
+            predicted = q_values.gather(1, action_tensor).squeeze(1)
+            loss = self.loss_fn(predicted, target_tensor)
+
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        self.learn_steps += 1
+        if self.learn_steps % self.target_sync_every == 0:
+            self.target_model.load_state_dict(self.model.state_dict())
+
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-def train_dqn(episodes=1000, model_path="dqn_model.pt", verbose=False):
+def train_dqn(episodes=1000, model_path="dqn_model.pt", verbose=False, device="auto"):
     env = SolitaireEnv()
     state_size = 12
     action_space = generate_action_space()
     action_size = len(action_space)
-    agent = DQNAgent(state_size, action_size)
+    torch_device = resolve_torch_device(device)
+    if torch_device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    print(f"Training device: {torch_device}")
+    agent = DQNAgent(state_size, action_size, device=torch_device)
     completion_scores = []
+    wins = 0
 
     for ep in range(episodes):
         state = flatten_state(env.reset())
@@ -512,26 +642,22 @@ def train_dqn(episodes=1000, model_path="dqn_model.pt", verbose=False):
 
         if verbose:
             print_tableau(env.tableau, env.stock, env.waste, env.foundation)
-            print("Reward: —")
+            print("Reward: -")
 
-        state_counter = defaultdict(int)
         while not done:
-            legal = get_legal_action_ids(env.legal_actions(), action_space)
+            legal_actions = env.legal_actions()
+            legal = get_legal_action_ids(legal_actions, action_space)
             if not legal:
                 if verbose:
-                    print("⚠️ Нет допустимых действий! Завершаем эпизод.")
+                    print("No legal actions. Ending episode.")
                 break
             action_idx = agent.act(state, legal)
             action = action_space[action_idx]
             next_state_raw, reward, done = env.step(action)
             next_state = flatten_state(next_state_raw)
-            agent.remember(state, action_idx, reward, next_state, done)
+            next_legal = get_legal_action_ids(env.legal_actions(), action_space)
+            agent.remember(state, action_idx, reward, next_state, next_legal, done)
             state = next_state
-            state_counter[tuple(next_state)] += 1
-            if state_counter[tuple(next_state)] > 3:
-                if verbose:
-                    print("🔁 Зацикливание. Завершаем эпизод.")
-                break
             agent.replay()
 
             if verbose:
@@ -539,26 +665,30 @@ def train_dqn(episodes=1000, model_path="dqn_model.pt", verbose=False):
                 print(f"Reward: {reward}")
                 bar_width = 20
                 filled = int((ep + 1) / episodes * bar_width)
-                bar = '█' * filled + '▒' * (bar_width - filled)
-                print(f"Эпизод {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Прогресс: {env.completion_percent():.1f}%\n")
+                bar = "#" * filled + "-" * (bar_width - filled)
+                print(f"Episode {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Completion: {env.completion_percent():.1f}%")
 
         percent = env.completion_percent()
         completion_scores.append(percent)
+        if percent >= 100.0:
+            wins += 1
         bar_width = 20
         filled = int((ep + 1) / episodes * bar_width)
-        bar = '█' * filled + '▒' * (bar_width - filled)
-        print(f"\rЭпизод {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% | Прогресс: {percent:.1f}%", end='', flush=True)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        print(
+            f"\rEpisode {ep+1}/{episodes} [{bar}] {100*(ep+1)/episodes:.1f}% "
+            f"| Completion: {percent:.1f}% | eps: {agent.epsilon:.3f}",
+            end='',
+            flush=True,
+        )
 
     avg_completion = sum(completion_scores) / len(completion_scores)
-    print(f"\nСредний прогресс за {episodes} эпизодов: {avg_completion:.1f}% карт.\n")
+    win_rate = 100.0 * wins / max(1, episodes)
+    print(f"\nAverage completion over {episodes} episodes: {avg_completion:.1f}% of cards.\n")
+    print(f"Wins: {wins}/{episodes} ({win_rate:.2f}%)\n")
 
     torch.save(agent.model.state_dict(), model_path)
-    print(f"DQN модель сохранена в {model_path}")
-
-
-    torch.save(agent.model.state_dict(), model_path)
-    print(f"DQN модель сохранена в {model_path}")
-
+    print(f"DQN model saved to {model_path}")
 def flatten_state(state: Tuple[Any, ...]) -> List[float]:
     foundation, deck_card, tableau = state
     f_vec = list(foundation)
@@ -590,20 +720,25 @@ def get_legal_action_ids(legal_actions: List[Tuple[Any, ...]], action_space: Lis
     return [i for i, act in enumerate(action_space) if act in legal_set]
 
 
-def play_with_model(model_path: str, use_dqn: bool = False):
+def play_with_model(model_path: str, use_dqn: bool = False, device: str = "auto"):
     if use_dqn or model_path.endswith(".pt"):
         state_size = 12
         action_space = generate_action_space()
         action_size = len(action_space)
-        agent = DQNAgent(state_size, action_size)
+        torch_device = resolve_torch_device(device)
+        agent = DQNAgent(state_size, action_size, device=torch_device)
         try:
-            agent.model.load_state_dict(torch.load(model_path))
+            agent.model.load_state_dict(torch.load(model_path, map_location=torch_device))
+            agent.target_model.load_state_dict(agent.model.state_dict())
         except FileNotFoundError:
-            print(f"[!] Файл модели {model_path} не найден.")
+            print(f"[!] Model file not found: {model_path}")
             return
         agent.model.eval()
 
-        class DQNKosynkaBot(KosynkaBot):
+        class DQNKosynkaBot(RLKosynkaBot):
+            def __init__(self):
+                super().__init__(defaultdict(float))
+
             def run_loop(self_inner):
                 x, y = self_inner.root.winfo_x(), self_inner.root.winfo_y()
                 w, h = self_inner.root.winfo_width(), self_inner.root.winfo_height()
@@ -613,11 +748,13 @@ def play_with_model(model_path: str, use_dqn: bool = False):
                     field_img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
                     gray_field = cv2.cvtColor(field_img, cv2.COLOR_BGR2GRAY)
                     self_inner.img_width = field_img.shape[1]
+                    self_inner.img_height = field_img.shape[0]
                     matches = self_inner.match_all_cards(gray_field)
                     matches = self_inner.filter_duplicates(matches)
                     field = self_inner.build_field_structure_dynamic(matches, field_img.shape[1])
-                    deck_card = self_inner.detect_deck_card(matches)
-                    homes = self_inner.detect_home_cards(matches)
+                    deck_card = self_inner.detect_deck_card(matches, self_inner.img_width, self_inner.img_height)
+                    homes = self_inner.detect_home_cards(matches, self_inner.img_width, self_inner.img_height)
+                    self_inner.update_stock_click(deck_card)
                     self_inner.update_home_state_from_homes(homes)
 
                     foundation = (
@@ -637,8 +774,15 @@ def play_with_model(model_path: str, use_dqn: bool = False):
                     all_actions = self_inner.board_actions(deck_card, field, x, y)
                     action_tuples = [a[0] for a in all_actions]
                     legal_ids = get_legal_action_ids(action_tuples, action_space)
+                    if not legal_ids:
+                        self_inner.click_stock(x, y)
+                        time.sleep(1.0)
+                        continue
+
                     chosen_idx = agent.act(state, legal_ids)
-                    action, exec_info = all_actions[legal_ids.index(chosen_idx)]
+                    chosen_action = action_space[chosen_idx]
+                    exec_map = {a: e for a, e in all_actions}
+                    exec_info = exec_map.get(chosen_action, ('click_deck',))
 
                     match exec_info[0]:
                         case 'double':
@@ -649,17 +793,15 @@ def play_with_model(model_path: str, use_dqn: bool = False):
                             pyautogui.moveTo(x + src[0], y + src[1])
                             pyautogui.dragTo(x + dst[0], y + dst[1], duration=0.4)
                         case 'click_deck':
-                            pyautogui.click(x + 60, y + 60)
+                            self_inner.click_stock(x, y)
                     time.sleep(1.0)
                 self_inner.root.deiconify()
 
-        DQNKosynkaBot().run()
+        DQNKosynkaBot()
 
     else:
         q = load_model(model_path)
-        RLKosynkaBot(q).run()
-
-
+        RLKosynkaBot(q)
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Solitaire RL tools')
@@ -669,16 +811,20 @@ if __name__ == '__main__':
     parser.add_argument('--play', action='store_true', help='play using a saved model')
     parser.add_argument('--verbose', action='store_true', help='enable verbose training output')
     parser.add_argument('--dqn', action='store_true', help='train DQN neural network instead of Q-learning')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'], help='device for DQN (auto/cpu/cuda)')
 
     args = parser.parse_args()
     if args.train:
         if args.dqn:
-            train_dqn(args.episodes, model_path=args.model, verbose=args.verbose)
+            train_dqn(args.episodes, model_path=args.model, verbose=args.verbose, device=args.device)
         else:
             q = train_q_learning(args.episodes, verbose=args.verbose)
             save_model(q, args.model)
             print(f'Model saved to {args.model}')
     elif args.play:
-        play_with_model(args.model, use_dqn=args.dqn)
+        play_with_model(args.model, use_dqn=args.dqn, device=args.device)
     else:
         parser.print_help()
+
+
+
